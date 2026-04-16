@@ -1,0 +1,143 @@
+blueprint:
+  name: Room Occupancy Detection
+  description: >
+    Detects room occupancy using motion and contact sensors.
+    Outputs to an input_boolean helper.
+
+    - Occupancy turns ON when any motion sensor activates.
+    - After all motion sensors clear, occupancy turns OFF after the configured delay.
+    - If motion is detected during the delay, the timer resets (mode: restart).
+    - If all contact sensors are already closed when motion turns ON (sealed room):
+      - If all motion clears while still sealed, occupancy stays ON
+        until a contact sensor opens, then the delay is applied.
+      - If a contact opens while motion is still active (seal broken),
+        the normal delay is applied once all motion clears.
+    - If contacts close after motion was already on, the normal delay applies
+      once all motion clears.
+
+    Requires an input_boolean helper to be created manually.
+  domain: automation
+  input:
+    motion_sensors:
+      name: Motion Sensors
+      description: Motion sensors to monitor for occupancy.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: motion
+          multiple: true
+    contact_sensors:
+      name: Contact Sensors
+      description: Door/window contact sensors to monitor.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class:
+            - door
+            - window
+            - opening
+          multiple: true
+    duration:
+      name: Off Delay
+      description: How long to wait after all motion clears before turning off occupancy.
+      default:
+        minutes: 1
+      selector:
+        duration:
+    occupancy_entity:
+      name: Occupancy Entity
+      description: input_boolean helper that represents room occupancy state.
+      selector:
+        entity:
+          domain: input_boolean
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  motion_sensors: !input motion_sensors
+  contact_sensors: !input contact_sensors
+  # Sealed = all contact sensors are closed RIGHT NOW (at the moment motion turned on).
+  # Only true when there is at least one contact sensor.
+  sealed: >
+    {% set contacts = expand(contact_sensors)
+       | rejectattr('state', 'in', ['unknown', 'unavailable']) | list %}
+    {{ contacts | length > 0 and
+       contacts | selectattr('state', 'eq', 'off') | list | count
+       == contacts | count }}
+
+trigger:
+  - platform: state
+    entity_id: !input motion_sensors
+    to: "on"
+    not_from:
+      - unknown
+      - unavailable
+
+action:
+  # 1. Turn on occupancy
+  - service: input_boolean.turn_on
+    target:
+      entity_id: !input occupancy_entity
+
+  - if:
+      - condition: template
+        value_template: "{{ sealed }}"
+    then:
+      # --- SEALED PATH ---
+      # Room was sealed when motion turned on.
+      # Wait for EITHER all motion off OR any contact opening — whichever comes first.
+      - wait_for_trigger:
+          - platform: template
+            value_template: >
+              {{ expand(motion_sensors)
+                 | selectattr('state', 'eq', 'on')
+                 | list | count == 0 }}
+            id: all_motion_off
+          - platform: state
+            entity_id: !input contact_sensors
+            to: "on"
+            not_from:
+              - unknown
+              - unavailable
+            id: contact_opened
+      - choose:
+          # A contact opened while motion was still active → seal is broken.
+          # Wait for all motion to clear, then apply normal delay.
+          - conditions:
+              - condition: template
+                value_template: "{{ wait.trigger.id == 'contact_opened' }}"
+            sequence:
+              - wait_template: >
+                  {{ expand(motion_sensors)
+                     | selectattr('state', 'eq', 'on')
+                     | list | count == 0 }}
+              - delay: !input duration
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: !input occupancy_entity
+        # All motion cleared while room is still sealed.
+        # Wait for a contact to open, then apply delay.
+        default:
+          - wait_for_trigger:
+              - platform: state
+                entity_id: !input contact_sensors
+                to: "on"
+                not_from:
+                  - unknown
+                  - unavailable
+          - delay: !input duration
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input occupancy_entity
+    else:
+      # --- NORMAL PATH ---
+      # Room was not sealed. Wait for all motion off, then delay, then off.
+      - wait_template: >
+          {{ expand(motion_sensors)
+             | selectattr('state', 'eq', 'on')
+             | list | count == 0 }}
+      - delay: !input duration
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !input occupancy_entity

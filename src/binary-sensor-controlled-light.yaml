@@ -1,0 +1,68 @@
+blueprint:
+  name: Binary Sensor Controlled Light
+  description: >
+    Turns a light on/off based on a binary sensor.
+
+    - When the sensor turns on, the light turns on.
+    - When the sensor turns off, the light turns off — unless a user has manually
+      interacted with the light in the meantime (changed brightness, or turned it
+      off and on again). In that case the light is left as-is.
+  domain: automation
+  input:
+    binary_sensor:
+      name: Binary Sensor
+      description: The binary sensor that controls the light.
+      selector:
+        entity:
+          domain: binary_sensor
+    light_entity:
+      name: Light
+      description: The light to control.
+      selector:
+        entity:
+          domain: light
+
+mode: parallel
+max_exceeded: silent
+
+variables:
+  light_entity: !input light_entity
+
+trigger:
+  - platform: state
+    entity_id: !input binary_sensor
+    to: "on"
+    not_from:
+      - unknown
+      - unavailable
+    id: sensor_on
+  - platform: state
+    entity_id: !input binary_sensor
+    to: "off"
+    not_from:
+      - unknown
+      - unavailable
+    id: sensor_off
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: sensor_on
+        sequence:
+          - service: light.turn_on
+            target:
+              entity_id: !input light_entity
+
+      - conditions:
+          - condition: trigger
+            id: sensor_off
+        sequence:
+          # Only turn off if the light was last changed by this automation (not by a user).
+          # A manual user interaction (brightness change, on/off toggle) sets context.user_id
+          # to the user's ID. Automation-driven changes leave context.user_id as none.
+          - condition: template
+            value_template: "{{ states[light_entity].context.user_id is none }}"
+          - service: light.turn_off
+            target:
+              entity_id: !input light_entity
